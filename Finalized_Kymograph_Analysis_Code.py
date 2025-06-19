@@ -166,7 +166,6 @@ def analyze_before_after_beam_oscillation(
     show_plots=True,
     use_movement_detector=True,
     std_window_size=5,
-    derivative_threshold=1,
     fallback_phase_threshold=1.5
 ):
     middle_col = img.shape[1] // 2
@@ -289,7 +288,6 @@ def plot_full_kymograph_before_after(filepath_pattern, phase_threshold=PTh, show
             show_plots=show_plots,
             use_movement_detector=True,
             std_window_size=WINDOW_LENGTH,
-            derivative_threshold=DT,
             fallback_phase_threshold=phase_threshold
         )
 
@@ -310,6 +308,6 @@ def plot_full_kymograph_analysis(filepath_pattern, show_plots=True):
 #plot_full_kymograph_analysis("C:/Users/ridhi/Downloads/*.tif", show_plots=True)
 
 # Analyze full kymograph split into before/after beam oscillation
-plot_full_kymograph_before_after("C:/Users/ridhi/Downloads/*.tif", show_plots=True)
+plot_full_kymograph_before_after("/home/max/Downloads/Kymographs/*.tif", show_plots=True)
 
 

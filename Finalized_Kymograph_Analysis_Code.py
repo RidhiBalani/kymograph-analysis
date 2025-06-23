@@ -158,6 +158,43 @@ def detect_movement_start(kymo: np.ndarray,
     # the index in activity corresponds to window‐start time
     return int(exceed[0])
 
+def choose_split_col(img, split):
+    """
+    Determine the column index to split an image.
+    If split is None, launches an interactive matplotlib session where you click to move
+    a vertical red line; final position on window close is used as split.
+    If split is float between 0 and 1, interprets as fraction of width.
+    If split is int, uses it directly (clipped to image width).
+    """
+    n_cols = img.shape[1]
+    if split is None:
+        fig, ax = plt.subplots()
+        ax.imshow(img, aspect='auto')
+        init_x = n_cols // 2
+        # draw initial red split line
+        line = ax.axvline(init_x, color='r', linestyle='--')
+        plt.title('Click to move split line; close when satisfied')
+        last_x = {'val': init_x}
+
+        def onclick(event):
+            if event.inaxes == ax and event.xdata is not None:
+                x = event.xdata
+                last_x['val'] = x
+                # set_xdata expects a sequence for x, so give it [x, x]
+                line.set_xdata([x, x])
+                fig.canvas.draw_idle()
+
+        cid = fig.canvas.mpl_connect('button_press_event', onclick)
+        plt.show()
+        fig.canvas.mpl_disconnect(cid)
+        col = int(last_x['val'])
+    elif isinstance(split, float):
+        col = int(n_cols * split)
+    elif isinstance(split, int):
+        col = split
+    else:
+        raise ValueError("`split` must be None, float, or int")
+    return max(1, min(col, n_cols - 1))
 
 def analyze_before_after_beam_oscillation(
     img, 
@@ -166,9 +203,10 @@ def analyze_before_after_beam_oscillation(
     show_plots=True,
     use_movement_detector=True,
     std_window_size=5,
-    fallback_phase_threshold=1.5
+    fallback_phase_threshold=1.5,
+    split=0.5  # Default split at middle column (0.5 means middle of the image width)
 ):
-    middle_col = img.shape[1] // 2
+    middle_col = choose_split_col(img, split)
     left_avg = np.mean(img[:, :middle_col], axis=1)
     right_avg = np.mean(img[:, middle_col:], axis=1)
     
@@ -288,7 +326,8 @@ def plot_full_kymograph_before_after(filepath_pattern, phase_threshold=PTh, show
             show_plots=show_plots,
             use_movement_detector=True,
             std_window_size=WINDOW_LENGTH,
-            fallback_phase_threshold=phase_threshold
+            fallback_phase_threshold=phase_threshold,
+            split=None
         )
 
 def plot_full_kymograph_analysis(filepath_pattern, show_plots=True):
@@ -308,6 +347,7 @@ def plot_full_kymograph_analysis(filepath_pattern, show_plots=True):
 #plot_full_kymograph_analysis("C:/Users/ridhi/Downloads/*.tif", show_plots=True)
 
 # Analyze full kymograph split into before/after beam oscillation
-plot_full_kymograph_before_after("/home/max/Downloads/Kymographs/*.tif", show_plots=True)
 
 
+if __name__ == "__main__":
+    plot_full_kymograph_before_after("/home/max/Downloads/Kymographs/*.tif", show_plots=True)

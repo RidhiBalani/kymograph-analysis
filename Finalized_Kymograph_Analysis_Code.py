@@ -12,6 +12,7 @@ from pathlib import Path
 import glob
 from tqdm import tqdm
 from numpy.lib.stride_tricks import sliding_window_view
+from scipy.ndimage import uniform_filter1d
 
 
 # Constants
@@ -21,8 +22,9 @@ POLYORDER = 2
 plt.rcParams["figure.dpi"] = 300
 PTh=1.3 #phase thresold
 TF=0.3 #movement detection thresold factor
+HILBERT_REMOVE=10
 
-def fourier_denoise(signal, dt, f_low=4.0, f_high=1000.0, f_rel_low=0.3,f_rel_high=5.0, power_cut=0.25, debug=False):
+def fourier_denoise(signal, dt, f_low=4.0, f_high=1000.0, f_rel_low=0.3,f_rel_high=5.0, power_cut=0.1, debug=False):
     """
     FFT‐based denoising of a 2D kymograph (time × space).
 
@@ -93,12 +95,12 @@ def fourier_denoise(signal, dt, f_low=4.0, f_high=1000.0, f_rel_low=0.3,f_rel_hi
         fig, axs = plt.subplots(2, 2, figsize=(12, 8))
 
         # Original vs denoised kymograph
-        axs[0, 0].imshow(signal, aspect='auto')
+        axs[0, 0].imshow(signal, aspect='auto',interpolation=None)
         axs[0, 0].set_title('Original Kymograph')
         axs[0, 0].set_xlabel('Space (px)')
         axs[0, 0].set_ylabel('Time (frames)')
 
-        axs[0, 1].imshow(denoised, aspect='auto')
+        axs[0, 1].imshow(denoised, aspect='auto',interpolation=None)
         axs[0, 1].set_title('Denoised Kymograph')
         axs[0, 1].set_xlabel('Space (px)')
 
@@ -190,7 +192,7 @@ def align_stripes(kymo, win=300, max_shift=10, debug=False):
             lags[s] = best_d
 
         # zero‐mean over space
-        lags = lags - np.mean(lags)
+        lags = lags - int(np.mean(lags))
         lag_map[t] = lags
 
     # Apply per-frame shifts
@@ -208,40 +210,78 @@ def align_stripes(kymo, win=300, max_shift=10, debug=False):
 
     # Debug plots
     if debug:
-        fig, axs = plt.subplots(1, 3, figsize=(15, 4))
+        fig, axs = plt.subplots(2, 2, figsize=(14, 8))
 
-        im = axs[0].imshow(
-            lag_map.T, aspect='auto', cmap='RdBu_r',
-            extent=[0, n_t, 0, n_s]
+        # Lag map
+        im0 = axs[0, 0].imshow(
+            lag_map, aspect='auto', cmap='RdBu_r',interpolation=None
         )
-        axs[0].set_title('Lag Map (frames)')
-        axs[0].set_xlabel('Time')
-        axs[0].set_ylabel('Stripe index')
-        fig.colorbar(im, ax=axs[0], label='lag')
+        axs[0, 0].set_title('Lag Map (frames)')
+        axs[0, 0].set_ylabel('Time')
+        axs[0, 0].set_xlabel('Stripe index')
+        fig.colorbar(im0, ax=axs[0, 0], label='lag')
 
-        axs[1].plot(orig_avg, label='Original avg')
-        axs[1].plot(aligned_avg, label='Aligned avg', alpha=0.8)
-        axs[1].set_title('Spatial Average')
-        axs[1].set_xlabel('Time')
-        axs[1].legend()
+        # Shifted (aligned) kymograph
+        im1 = axs[0, 1].imshow(aligned, aspect='auto',interpolation=None)
+        axs[0, 1].set_title('Shifted Kymograph')
+        axs[0, 1].set_ylabel('Time')
+        axs[0, 1].set_xlabel('Stripe index')
+        fig.colorbar(im1, ax=axs[0, 1], label='intensity')
 
-        axs[2].plot(orig_avg - aligned_avg)
-        axs[2].set_title('Difference (orig − aligned)')
-        axs[2].set_xlabel('Time')
+        # Spatial average
+        axs[1, 0].plot(orig_avg, label='Original avg')
+        axs[1, 0].plot(aligned_avg, label='Aligned avg', alpha=0.8)
+        axs[1, 0].set_title('Spatial Average')
+        axs[1, 0].set_xlabel('Time')
+        axs[1, 0].legend()
+
+        # Difference trace
+        axs[1, 1].imshow(kymo, aspect='auto',interpolation=None)
+        axs[1, 1].set_title('Original Kymograph')
+        axs[1, 1].set_ylabel('Time')
 
         plt.tight_layout()
         plt.show()
 
     return aligned_avg
 
+def compute_phase_from_protophi(protophi: np.ndarray, nharm: int = 10) -> np.ndarray:
+    """
+    Compute a proper phase from a given protophase using harmonic correction.
+
+    Parameters:
+    - protophi (np.ndarray): Real-valued 1D array representing protophase angles (in radians).
+    - nharm (int): Number of harmonics to use in correction (default: 10).
+
+    Returns:
+    - np.ndarray: Unwrapped corrected phase of the same shape as protophi.
+    """
+    if not isinstance(protophi, np.ndarray) or protophi.ndim != 1:
+        raise ValueError("protophi must be a 1D NumPy array")
+    if not np.issubdtype(protophi.dtype, np.floating):
+        raise ValueError("protophi must be a real-valued array")
+
+    k = np.arange(1, nharm + 1)
+    exp_kphi = np.exp(-1j * np.outer(k, protophi))  # shape: (nharm, len(protophi))
+    Sn_pos = np.mean(exp_kphi, axis=1)  # shape: (nharm,)
+
+    phi = protophi.astype(np.complex128)
+    correction_terms = Sn_pos[:, None] * (np.exp(1j * np.outer(k, protophi)) - 1) / (1j * k[:, None])
+    phi += 2 * np.sum(correction_terms, axis=0)
+
+    return np.unwrap(np.real(phi))
+
 
 def process_signal(signal, dt=DT):
     signal = signal - np.mean(signal,axis=0)  # Remove DC offset
-    denoised,denoised_removed, peak_freq = fourier_denoise(signal,dt)
-    aligned=align_stripes(denoised_removed,win=int(10/(peak_freq*DT)), max_shift=int(0.5/(peak_freq*DT))-1)
+    denoised,denoised_removed, peak_freq = fourier_denoise(signal,dt,f_rel_low=0.3,f_rel_high=1.7, debug=False)
+    denoised_removed = denoised_removed - uniform_filter1d(denoised_removed, size=int(5/(peak_freq*DT)), axis=0, mode='nearest')
+    #aligned=align_stripes(denoised_removed,win=int(5/(peak_freq*DT)), max_shift=int(0.5/(peak_freq*DT))+1, debug=True)
+    aligned = np.mean(denoised_removed,axis=1)
     analytic = hilbert(aligned)
-    
+    analytic = analytic[HILBERT_REMOVE:-HILBERT_REMOVE] # Remove edge artifacts from Hilbert transform
     phase = np.unwrap(np.angle(analytic))
+    phase=compute_phase_from_protophi(phase)
     freq = (phase[-1]-phase[0]) / (2.0 * np.pi * dt * phase.shape[0])
 
     return {
@@ -270,25 +310,47 @@ def plot_analysis(time, c_data, b_data, filename, title_prefix="", segment_img=N
     # plt.legend()
     # plt.tight_layout()
     # plt.show()
-
+    time = time[HILBERT_REMOVE:-HILBERT_REMOVE]  # Adjust time to match analytic data length
     plt.figure(figsize=(10, 8))
     plt.subplot(3, 1, 1)
-    plt.plot(time, c_data['analytic'].real, color='purple', label='Cilia')
-    plt.plot(time, b_data['analytic'].real, color='orange', label='Beam')
+    plt.plot(time, c_data['analytic'].real/np.std(c_data['analytic'].real), color='purple', label='Cilia')
+    plt.plot(time, b_data['analytic'].real/np.std(b_data['analytic'].real), color='orange', label='Beam')
     plt.ylabel('Intensity')
     plt.legend()
 
     plt.subplot(3, 1, 2)
-    plt.plot(time, c_data['phase'], color='purple', label=f'C frequency (phase): {c_data["freq_phase"]:.2f}')
-    plt.plot(time, b_data['phase'], color='orange', label=f'B frequency (phase): {b_data["freq_phase"]:.2f}')
+    plt.plot(time, c_data['phase'], color='purple', label=f'C frequency (phase): {c_data["freq_phase"]:.2f} Hz')
+    plt.plot(time, b_data['phase'], color='orange', label=f'B frequency (phase): {b_data["freq_phase"]:.2f} Hz')
     plt.ylabel('Phase')
     plt.legend()
 
     plt.subplot(3, 1, 3)
-    plt.plot(time, c_data['phase']-2*np.pi*c_data['freq_phase']*(time-time[0])-c_data['phase'][0], color='purple', label=f'C phase change')
-    plt.plot(time, b_data['phase']-2*np.pi*b_data['freq_phase']*(time-time[0])-b_data['phase'][0], color='orange', label=f'B phase change')
+    # Phase deviation from linear fit
+    c_dev = c_data['phase'] - 2 * np.pi * c_data['freq_phase'] * (time - time[0]) - c_data['phase'][0]
+    b_dev = b_data['phase'] - 2 * np.pi * b_data['freq_phase'] * (time - time[0]) - b_data['phase'][0]
+    diff = c_data['phase'] - b_data['phase']
+
+    plt.plot(time, c_dev, color='purple', label='C phase change')
+    plt.plot(time, b_dev, color='orange', label='B phase change')
+    plt.plot(time, diff, color='blue', label='C phase - B phase')
+
+    # Determine y-range
+    y_min = min(np.min(c_dev), np.min(b_dev), np.min(diff))
+    y_max = max(np.max(c_dev), np.max(b_dev), np.max(diff))
+
+    # Compute vertical line positions in the phase range
+    phase_min = np.floor(y_min / (2 * np.pi))
+    phase_max = np.ceil(y_max / (2 * np.pi))
+
+    for n in np.arange(phase_min, phase_max + 0.5):
+        pos = n * np.pi
+        if n % 2 == 0:
+            plt.axhline(pos, color='black', linestyle='--', linewidth=0.5)  # integer multiples
+        else:
+            plt.axhline(pos, color='black', linestyle=':', linewidth=0.5)   # half-integer multiples
+
     plt.xlabel('Time (s)')
-    plt.ylabel('Frequency (Hz)')
+    plt.ylabel('Phase difference')
     plt.legend()
     plt.tight_layout()
     plt.show()
@@ -310,7 +372,7 @@ def plot_analysis(time, c_data, b_data, filename, title_prefix="", segment_img=N
 
     if segment_img is not None:
         plt.figure(figsize=(10, 5))
-        plt.imshow(segment_img)
+        plt.imshow(segment_img,interpolation=None)
         plt.title(f'{title_prefix}\n{filename}')
         plt.show()
 
@@ -361,7 +423,7 @@ def choose_split_col(img, split):
     n_cols = img.shape[1]
     if split is None:
         fig, ax = plt.subplots()
-        ax.imshow(img, aspect='auto')
+        ax.imshow(img, aspect='auto',interpolation=None)
         init_x = n_cols // 2
         # draw initial red split line
         line = ax.axvline(init_x, color='r', linestyle='--')
@@ -487,6 +549,7 @@ def plot_full_kymograph_before_after(filepath_pattern, phase_threshold=PTh, show
             fallback_phase_threshold=phase_threshold,
             split=None
         )
+
 
 if __name__ == "__main__":
     plot_full_kymograph_before_after("/home/max/Downloads/Kymographs/*.tif", show_plots=True)

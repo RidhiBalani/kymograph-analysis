@@ -22,7 +22,7 @@ POLYORDER = 2
 plt.rcParams["figure.dpi"] = 300
 PTh=1.3 #phase thresold
 TF=0.3 #movement detection thresold factor
-HILBERT_REMOVE=10
+HILBERT_REMOVE=20
 
 def fourier_denoise(signal, dt, f_low=4.0, f_high=1000.0, f_rel_low=0.3,f_rel_high=5.0, power_cut=0.1, debug=False):
     """
@@ -274,8 +274,8 @@ def compute_phase_from_protophi(protophi: np.ndarray, nharm: int = 10) -> np.nda
 
 def process_signal(signal, dt=DT):
     signal = signal - np.mean(signal,axis=0)  # Remove DC offset
-    denoised,denoised_removed, peak_freq = fourier_denoise(signal,dt,f_rel_low=0.3,f_rel_high=1.7, debug=False)
-    denoised_removed = denoised_removed - uniform_filter1d(denoised_removed, size=int(5/(peak_freq*DT)), axis=0, mode='nearest')
+    denoised,denoised_removed, peak_freq = fourier_denoise(signal,dt,f_rel_low=0.3,f_rel_high=1.7, debug=True)
+    #denoised_removed = denoised_removed - uniform_filter1d(denoised_removed, size=int(5/(peak_freq*DT)), axis=0, mode='nearest')
     #aligned=align_stripes(denoised_removed,win=int(5/(peak_freq*DT)), max_shift=int(0.5/(peak_freq*DT))+1, debug=True)
     aligned = np.mean(denoised_removed,axis=1)
     analytic = hilbert(aligned)
@@ -314,40 +314,45 @@ def plot_analysis(time, c_data, b_data, filename, title_prefix="", segment_img=N
     plt.figure(figsize=(10, 8))
     plt.subplot(3, 1, 1)
     plt.plot(time, c_data['analytic'].real/np.std(c_data['analytic'].real), color='purple', label='Cilia')
-    plt.plot(time, b_data['analytic'].real/np.std(b_data['analytic'].real), color='orange', label='Beam')
+    if b_data is not None:
+        plt.plot(time, b_data['analytic'].real/np.std(b_data['analytic'].real), color='orange', label='Beam')
     plt.ylabel('Intensity')
     plt.legend()
 
     plt.subplot(3, 1, 2)
     plt.plot(time, c_data['phase'], color='purple', label=f'C frequency (phase): {c_data["freq_phase"]:.2f} Hz')
-    plt.plot(time, b_data['phase'], color='orange', label=f'B frequency (phase): {b_data["freq_phase"]:.2f} Hz')
+    if b_data is not None:
+        plt.plot(time, b_data['phase'], color='orange', label=f'B frequency (phase): {b_data["freq_phase"]:.2f} Hz')
     plt.ylabel('Phase')
     plt.legend()
 
     plt.subplot(3, 1, 3)
     # Phase deviation from linear fit
     c_dev = c_data['phase'] - 2 * np.pi * c_data['freq_phase'] * (time - time[0]) - c_data['phase'][0]
-    b_dev = b_data['phase'] - 2 * np.pi * b_data['freq_phase'] * (time - time[0]) - b_data['phase'][0]
-    diff = c_data['phase'] - b_data['phase']
+    if b_data is not None:
+        b_dev = b_data['phase'] - 2 * np.pi * b_data['freq_phase'] * (time - time[0]) - b_data['phase'][0]
+        diff = c_data['phase'] - b_data['phase']
 
     plt.plot(time, c_dev, color='purple', label='C phase change')
-    plt.plot(time, b_dev, color='orange', label='B phase change')
-    plt.plot(time, diff, color='blue', label='C phase - B phase')
+    if b_data is not None:
+        plt.plot(time, b_dev, color='orange', label='B phase change')
+        
 
-    # Determine y-range
-    y_min = min(np.min(c_dev), np.min(b_dev), np.min(diff))
-    y_max = max(np.max(c_dev), np.max(b_dev), np.max(diff))
+        # Determine y-range
+        y_min = min(np.min(c_dev), np.min(b_dev), np.min(diff))
+        y_max = max(np.max(c_dev), np.max(b_dev), np.max(diff))
 
-    # Compute vertical line positions in the phase range
-    phase_min = np.floor(y_min / (2 * np.pi))
-    phase_max = np.ceil(y_max / (2 * np.pi))
-
-    for n in np.arange(phase_min, phase_max + 0.5):
-        pos = n * np.pi
-        if n % 2 == 0:
-            plt.axhline(pos, color='black', linestyle='--', linewidth=0.5)  # integer multiples
-        else:
-            plt.axhline(pos, color='black', linestyle=':', linewidth=0.5)   # half-integer multiples
+        # Compute vertical line positions in the phase range
+        phase_min = np.floor(y_min / (2 * np.pi))
+        phase_max = np.ceil(y_max / (2 * np.pi))
+        if np.abs(phase_min - phase_max) < 10:
+            plt.plot(time, diff, color='blue', label='C phase - B phase')
+            for n in np.arange(phase_min, phase_max + 0.5):
+                pos = n * np.pi
+                if n % 2 == 0:
+                    plt.axhline(pos, color='black', linestyle='--', linewidth=0.5)  # integer multiples
+                else:
+                    plt.axhline(pos, color='black', linestyle=':', linewidth=0.5)   # half-integer multiples
 
     plt.xlabel('Time (s)')
     plt.ylabel('Phase difference')
@@ -361,14 +366,14 @@ def plot_analysis(time, c_data, b_data, filename, title_prefix="", segment_img=N
     plt.title('C Hilbert Transform')
     plt.xlabel('Real')
     plt.ylabel('Imaginary')
-
-    plt.subplot(1, 2, 2)
-    plt.plot(np.real(b_data['analytic']), np.imag(b_data['analytic']), color='orange')
-    plt.title('B Hilbert Transform')
-    plt.xlabel('Real')
-    plt.ylabel('Imaginary')
-    plt.tight_layout()
-    plt.show()
+    if b_data is not None:
+        plt.subplot(1, 2, 2)
+        plt.plot(np.real(b_data['analytic']), np.imag(b_data['analytic']), color='orange')
+        plt.title('B Hilbert Transform')
+        plt.xlabel('Real')
+        plt.ylabel('Imaginary')
+        plt.tight_layout()
+        plt.show()
 
     if segment_img is not None:
         plt.figure(figsize=(10, 5))
@@ -412,43 +417,91 @@ def detect_movement_start(kymo: np.ndarray,
     # the index in activity corresponds to window‐start time
     return int(exceed[0])
 
-def choose_split_col(img, split):
+def choose_split_bounds(img, bounds=None):
     """
-    Determine the column index to split an image.
-    If split is None, launches an interactive matplotlib session where you click to move
-    a vertical red line; final position on window close is used as split.
-    If split is float between 0 and 1, interprets as fraction of width.
-    If split is int, uses it directly (clipped to image width).
+    Let user interactively choose two column bounds on `img`.
+    - bounds: tuple(float or int or None, float or int or None)
+        If not None, each element can be:
+          - float in (0,1): fraction of width
+          - int: absolute column
+          - None: interactive
+        Defaults to (0.5, 0.5) (center, center).
+    Returns
+    -------
+    left, right : int
+        The two column indices, clipped to [1, n_cols-1] and ordered.
     """
     n_cols = img.shape[1]
-    if split is None:
-        fig, ax = plt.subplots()
-        ax.imshow(img, aspect='auto',interpolation=None)
-        init_x = n_cols // 2
-        # draw initial red split line
-        line = ax.axvline(init_x, color='r', linestyle='--')
-        plt.title('Click to move split line; close when satisfied')
-        last_x = {'val': init_x}
+    # resolve initial
+    left, right = bounds if bounds is not None else (0.5, 0.5)
+    def resolve(x):
+        if x is None: return None
+        return int(n_cols * x) if isinstance(x, float) else x
+    left = resolve(left)
+    right = resolve(right)
 
-        def onclick(event):
-            if event.inaxes == ax and event.xdata is not None:
-                x = event.xdata
-                last_x['val'] = x
-                # set_xdata expects a sequence for x, so give it [x, x]
-                line.set_xdata([x, x])
-                fig.canvas.draw_idle()
+    if left is not None and right is not None:
+        # both fixed
+        return *sorted((left, right)), 
 
-        cid = fig.canvas.mpl_connect('button_press_event', onclick)
-        plt.show()
-        fig.canvas.mpl_disconnect(cid)
-        col = int(last_x['val'])
-    elif isinstance(split, float):
-        col = int(n_cols * split)
-    elif isinstance(split, int):
-        col = split
-    else:
-        raise ValueError("`split` must be None, float, or int")
-    return max(1, min(col, n_cols - 1))
+    # interactive
+    fig, ax = plt.subplots()
+    ax.imshow(img, aspect='auto', interpolation=None)
+    # init lines
+    left = left or n_cols//2
+    right = right or n_cols//2
+    l_line = ax.axvline(left, color='r', linestyle='--')
+    r_line = ax.axvline(right, color='b', linestyle=':')
+    plt.title("Single-click to set LEFT (red); double-click to set RIGHT (blue);\nClose when done")
+
+    def onclick(event):
+        if event.inaxes != ax or event.xdata is None: return
+        x = int(event.xdata)
+        if event.dblclick:
+            # right boundary
+            nonlocal right
+            right = x
+            r_line.set_xdata([x, x])
+        else:
+            # left boundary
+            nonlocal left
+            left = x
+            l_line.set_xdata([x, x])
+        fig.canvas.draw_idle()
+
+    cid = fig.canvas.mpl_connect('button_press_event', onclick)
+    plt.show()
+    fig.canvas.mpl_disconnect(cid)
+
+    # clip and order
+    left = max(1, min(left, n_cols-1))
+    right = max(1, min(right, n_cols-1))
+    return (min(left, right), max(left, right))
+
+def plot_psd_signal(before_c, after_c, after_b):
+    plt.figure(figsize=(10, 5))
+    signals = {
+        'Cilium before': before_c['denoised'],
+        'Cilium after': after_c['denoised'],
+        'Beam': after_b['denoised']
+    }
+
+    for key, s in signals.items():
+        n_t = s.shape[0]
+        fft = np.fft.fft(s, axis=0)
+        freq = np.fft.fftfreq(n_t, d=DT)
+        psd = np.sum(np.abs(fft) ** 2,axis=1)  # shape (n_t,)
+
+        pos = freq >= 0
+        plt.plot(freq[pos], psd[pos]/np.max(psd), label=key)
+
+    plt.xlabel("Frequency (Hz)")
+    plt.ylabel("Power Spectral Density (a.u.)")
+    plt.title("PSD of Hilbert-Filtered Signals")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
 
 def analyze_before_after_beam_oscillation(
     img,
@@ -460,9 +513,9 @@ def analyze_before_after_beam_oscillation(
     fallback_phase_threshold=1.5,
     split=0.5  # Default split at middle column (0.5 means middle of the image width)
 ):
-    middle_col = choose_split_col(img, split)
-    left = img[:, :middle_col]
-    right= img[:, middle_col:]
+    left_col, right_col = choose_split_bounds(img, bounds=(None, None))
+    left  = img[:, :left_col]
+    right = img[:, right_col:]
 
     # Initialize split_index using detect_movement_start
     split_index = None
@@ -512,7 +565,7 @@ def analyze_before_after_beam_oscillation(
     after_time = time[split_index:]
 
     before_c = process_signal(left[:split_index,:])
-    before_b = process_signal(right[:split_index,:])
+    #before_b = process_signal(right[:split_index,:])
 
     after_c = process_signal(left[split_index:,:])
     after_b = process_signal(right[split_index:,:])
@@ -520,9 +573,9 @@ def analyze_before_after_beam_oscillation(
 
     # --- Plot results ---
     if show_plots:
-        if before_c and before_b:
+        if before_c :
             plot_analysis(
-                before_time, before_c, before_b, filename,
+                before_time, before_c, None, filename,
                 title_prefix="Before Beam Oscillations",
                 segment_img=img[:split_index]
             )
@@ -532,6 +585,8 @@ def analyze_before_after_beam_oscillation(
                 title_prefix="After Beam Oscillations",
                 segment_img=img[split_index:]
             )
+        if before_c and after_c and after_b:
+            plot_psd_signal(before_c,after_c,after_b)
 
 def plot_full_kymograph_before_after(filepath_pattern, phase_threshold=PTh, show_plots=True):
     filepaths = glob.glob(filepath_pattern)
@@ -549,7 +604,7 @@ def plot_full_kymograph_before_after(filepath_pattern, phase_threshold=PTh, show
             fallback_phase_threshold=phase_threshold,
             split=None
         )
-
+        
 
 if __name__ == "__main__":
     plot_full_kymograph_before_after("/home/max/Downloads/Kymographs/*.tif", show_plots=True)

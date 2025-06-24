@@ -10,6 +10,7 @@ import skimage.io as skio
 from scipy.signal import hilbert, savgol_filter
 from pathlib import Path
 import glob
+from tqdm import tqdm
 from numpy.lib.stride_tricks import sliding_window_view
 
 
@@ -18,56 +19,257 @@ DT = 0.0078  # Time resolution
 WINDOW_LENGTH = 5
 POLYORDER = 2
 plt.rcParams["figure.dpi"] = 300
-PTh=1.3 #phase thresold 
+PTh=1.3 #phase thresold
 TF=0.3 #movement detection thresold factor
 
-def fourier_denoise(signal, threshold_ratio=0.4):
-    fft_signal = np.fft.fft(signal)
-    amplitudes = np.abs(fft_signal)
-    threshold = threshold_ratio * np.max(amplitudes)
-    fft_signal[amplitudes < threshold] = 0
-    return np.fft.ifft(fft_signal).real
+def fourier_denoise(signal, dt, f_low=4.0, f_high=1000.0, f_rel_low=0.3,f_rel_high=5.0, power_cut=0.25, debug=False):
+    """
+    FFT‐based denoising of a 2D kymograph (time × space).
+
+    Parameters
+    ----------
+    signal : 2D array, shape (n_t, n_s)
+        Input kymograph: axis 0 is time, axis 1 is space.
+    dt : float
+        Time step between samples.
+    f_low : float
+        Lower cutoff frequency in Hz.
+    f_high : float
+        Upper cutoff frequency in Hz.
+    debug : bool
+        If True, plot original vs. denoised image and their PSDs.
+
+    Returns
+    -------
+    denoised : 2D array, same shape as `signal`
+        Real‐valued reconstruction after masking low‐amplitude
+        and out‐of‐band frequency components.
+    """
+    # FFT along time axis
+    fft_sig = np.fft.fft(signal, axis=0)         # shape (n_t, n_s)
+    n_t, n_s = signal.shape
+    
+    # Frequencies and amplitudes
+    freq = np.fft.fftfreq(n_t, d=dt)            # length n_t
+    amps = np.abs(fft_sig)                      # shape (n_t, n_s)
+
+    # PSD across spatial axis (after initial FFT)
+    psd = np.sum(amps**2, axis=1)  # shape (n_t,)
+
+    # Initial coarse band mask
+    coarse_band = (np.abs(freq) >= f_low) & (np.abs(freq) <= f_high)
+
+    # Find peak frequency in positive range
+    pos = (freq >= 0) & coarse_band
+    peak_idx = np.argmax(psd[pos])
+    peak_freq = freq[pos][peak_idx]
+
+    band_lower = peak_freq * f_rel_low
+    band_upper = peak_freq * f_rel_high
+    narrow_band = (np.abs(freq) >= band_lower) & (np.abs(freq) <= band_upper)
+
+    # Final mask = must be in both coarse and narrow band
+    final_mask = (coarse_band & narrow_band)[:, None]  # shape (n_t, 1)
+    fft_masked = fft_sig * final_mask
+
+    # Inverse FFT → denoised kymograph
+    denoised = np.fft.ifft(fft_masked, axis=0).real
+
+    # stripe masking
+    stripe_powers=np.sum(amps**2 * final_mask,axis=0)
+    stripe_mask = stripe_powers > np.max(stripe_powers) * power_cut 
+    denoised[:, ~stripe_mask] = 0
+    denoised_removed = denoised[:, stripe_mask]
+
+
+
+    # Debug plots
+    if debug:
+        masked_psd = np.sum(np.abs(fft_masked)**2, axis=1)
+
+        # Only plot non-negative freqs
+        pos = freq >= 0
+
+        fig, axs = plt.subplots(2, 2, figsize=(12, 8))
+
+        # Original vs denoised kymograph
+        axs[0, 0].imshow(signal, aspect='auto')
+        axs[0, 0].set_title('Original Kymograph')
+        axs[0, 0].set_xlabel('Space (px)')
+        axs[0, 0].set_ylabel('Time (frames)')
+
+        axs[0, 1].imshow(denoised, aspect='auto')
+        axs[0, 1].set_title('Denoised Kymograph')
+        axs[0, 1].set_xlabel('Space (px)')
+
+        # PSD: original
+        axs[1, 0].plot(freq[pos], psd[pos])
+        axs[1, 0].set_title('Original PSD')
+        axs[1, 0].set_xlabel('Frequency (Hz)')
+        axs[1, 0].set_ylabel('Power')
+
+        # PSD: masked
+        axs[1, 1].plot(freq[pos], masked_psd[pos])
+        axs[1, 1].set_title(f'Masked PSD\n(band {f_low}–{f_high} Hz)')
+        axs[1, 1].set_xlabel('Frequency (Hz)')
+
+        plt.tight_layout()
+        plt.show()
+
+    return denoised,denoised_removed, peak_freq
 
 def manual_slope(x, y):
     x_mean, y_mean = np.mean(x), np.mean(y)
     return np.sum((x - x_mean) * (y - y_mean)) / np.sum((x - x_mean) ** 2)
 
+def align_stripes(kymo, win=300, max_shift=10, debug=False):
+    """
+    Temporally align spatial stripes of a kymograph with a fully sliding window.
+
+    For each time t, center a window of length win (clipped at boundaries),
+    correlate each stripe to the window-mean over stripes,
+    subtract the spatial mean of lags (zero net shift),
+    and store into lag_map[t, :].
+
+    Finally shifts each stripe frame-by-frame according to lag_map
+    and returns the spatial average.
+
+    Parameters
+    ----------
+    kymo : 2D array, shape (n_t, n_s)
+        Input kymograph (time × space).
+    win : int
+        Window length (frames) for local correlation.
+    max_shift : int
+        Maximum lag (± frames) to test.
+    debug : bool
+        If True, show diagnostic plots.
+
+    Returns
+    -------
+    aligned_avg : 1D array, shape (n_t,)
+        Time series after alignment and spatial averaging.
+    """
+    n_t, n_s = kymo.shape
+    half = win // 2
+    d_range = np.arange(-max_shift, max_shift+1)
+
+    # Build continuous lag_map (n_t × n_s)
+    lag_map = np.zeros((n_t, n_s), dtype=float)
+    for t in tqdm(range(n_t), desc="Aligning stripes"):
+        # window bounds
+        st = t - half
+        en = st + win
+        if st < 0:
+            st = 0
+            en = min(win, n_t)
+        elif en > n_t:
+            en = n_t
+            st = max(0, n_t - win)
+
+        window = kymo[st:en]               # shape (w_i, n_s)
+        ref = np.nanmean(window, axis=1)   # mean over stripes → (w_i,)
+
+        lags = np.zeros(n_s, dtype=float)
+        for s in range(n_s):
+            cur = window[:, s]
+            best_r, best_d = -np.inf, 0
+            for d in d_range:
+                if d < 0:
+                    a, b = cur[-d:], ref[: len(cur[-d:])]
+                elif d > 0:
+                    a, b = cur[:-d], ref[d:]
+                else:
+                    a, b = cur, ref
+                if a.size > 1:
+                    r = np.corrcoef(a, b)[0, 1]
+                else:
+                    r = -np.inf
+                if r > best_r:
+                    best_r, best_d = r, d
+            lags[s] = best_d
+
+        # zero‐mean over space
+        lags = lags - np.mean(lags)
+        lag_map[t] = lags
+
+    # Apply per-frame shifts
+    aligned = np.full_like(kymo, np.nan)
+    for s in range(n_s):
+        for t in range(n_t):
+            d = int(round(lag_map[t, s]))
+            t2 = t + d
+            if 0 <= t2 < n_t:
+                aligned[t, s] = kymo[t2, s]
+
+    # Spatial average
+    aligned_avg = np.nanmean(aligned, axis=1)
+    orig_avg    = np.nanmean(kymo, axis=1)
+
+    # Debug plots
+    if debug:
+        fig, axs = plt.subplots(1, 3, figsize=(15, 4))
+
+        im = axs[0].imshow(
+            lag_map.T, aspect='auto', cmap='RdBu_r',
+            extent=[0, n_t, 0, n_s]
+        )
+        axs[0].set_title('Lag Map (frames)')
+        axs[0].set_xlabel('Time')
+        axs[0].set_ylabel('Stripe index')
+        fig.colorbar(im, ax=axs[0], label='lag')
+
+        axs[1].plot(orig_avg, label='Original avg')
+        axs[1].plot(aligned_avg, label='Aligned avg', alpha=0.8)
+        axs[1].set_title('Spatial Average')
+        axs[1].set_xlabel('Time')
+        axs[1].legend()
+
+        axs[2].plot(orig_avg - aligned_avg)
+        axs[2].set_title('Difference (orig − aligned)')
+        axs[2].set_xlabel('Time')
+
+        plt.tight_layout()
+        plt.show()
+
+    return aligned_avg
+
+
 def process_signal(signal, dt=DT):
-    signal -= np.mean(signal)
-    denoised = fourier_denoise(signal)
-    smoothed = savgol_filter(denoised, window_length=WINDOW_LENGTH, polyorder=POLYORDER)
-    analytic = hilbert(smoothed)
+    signal = signal - np.mean(signal,axis=0)  # Remove DC offset
+    denoised,denoised_removed, peak_freq = fourier_denoise(signal,dt)
+    aligned=align_stripes(denoised_removed,win=int(10/(peak_freq*DT)), max_shift=int(0.5/(peak_freq*DT))-1)
+    analytic = hilbert(aligned)
+    
     phase = np.unwrap(np.angle(analytic))
-    freq = np.diff(phase) / (2.0 * np.pi * dt)
-    slope = manual_slope(np.arange(len(phase)) * dt, phase)
-    smoothed_freq = savgol_filter(freq, window_length=WINDOW_LENGTH, polyorder=POLYORDER)
+    freq = (phase[-1]-phase[0]) / (2.0 * np.pi * dt * phase.shape[0])
+
     return {
-        'smoothed': smoothed,
+        'denoised': denoised,
         'analytic': analytic,
         'phase': phase,
-        'freq': freq,
-        'slope': slope,
-        'smoothed_freq': smoothed_freq
+        'freq_phase': freq,
+        'freq_PSD': peak_freq,
     }
 
-def plot_analysis(time, c_data, b_data, filename, title_prefix="", middle_col=None, segment_img=None):
-    plt.figure(figsize=(14, 6))
-    plt.suptitle(f'{title_prefix}\n{filename}')
-    plt.subplot(1, 2, 1)
-    plt.plot(time, c_data['smoothed'], color='purple', label='C (Left)')
-    plt.title(f'Left Half{f" (Cols 0–{middle_col-1})" if middle_col else ""}')
-    plt.xlabel('Time (s)')
-    plt.ylabel('Averaged Intensity')
-    plt.legend()
+def plot_analysis(time, c_data, b_data, filename, title_prefix="", segment_img=None):
+    # plt.figure(figsize=(14, 6))
+    # plt.suptitle(f'{title_prefix}\n{filename}')
+    # plt.subplot(1, 2, 1)
+    # plt.plot(time, c_data['denoised'], color='purple', label='C (Left)')
+    # plt.title(f'Left Half{f" (Cols 0–{middle_col-1})" if middle_col else ""}')
+    # plt.xlabel('Time (s)')
+    # plt.ylabel('Averaged Intensity')
+    # plt.legend()
 
-    plt.subplot(1, 2, 2)
-    plt.plot(time, b_data['smoothed'], color='orange', label='B (Right)')
-    plt.title(f'Right Half{f" (Cols {middle_col}–...)" if middle_col else ""}')
-    plt.xlabel('Time (s)')
-    plt.ylabel('Averaged Intensity')
-    plt.legend()
-    plt.tight_layout()
-    plt.show()
+    # plt.subplot(1, 2, 2)
+    # plt.plot(time, b_data['denoised'], color='orange', label='B (Right)')
+    # plt.title(f'Right Half{f" (Cols {middle_col}–...)" if middle_col else ""}')
+    # plt.xlabel('Time (s)')
+    # plt.ylabel('Averaged Intensity')
+    # plt.legend()
+    # plt.tight_layout()
+    # plt.show()
 
     plt.figure(figsize=(10, 8))
     plt.subplot(3, 1, 1)
@@ -77,14 +279,14 @@ def plot_analysis(time, c_data, b_data, filename, title_prefix="", middle_col=No
     plt.legend()
 
     plt.subplot(3, 1, 2)
-    plt.plot(time, c_data['phase'], color='purple', label=f'C slope: {c_data["slope"]:.2f}')
-    plt.plot(time, b_data['phase'], color='orange', label=f'B slope: {b_data["slope"]:.2f}')
+    plt.plot(time, c_data['phase'], color='purple', label=f'C frequency (phase): {c_data["freq_phase"]:.2f}')
+    plt.plot(time, b_data['phase'], color='orange', label=f'B frequency (phase): {b_data["freq_phase"]:.2f}')
     plt.ylabel('Phase')
     plt.legend()
 
     plt.subplot(3, 1, 3)
-    plt.plot(time[:-1], c_data['smoothed_freq'], color='purple', label=f'C avg freq: {np.mean(c_data["freq"]):.2f} Hz')
-    plt.plot(time[:-1], b_data['smoothed_freq'], color='orange', label=f'B avg freq: {np.mean(b_data["freq"]):.2f} Hz')
+    plt.plot(time, c_data['phase']-2*np.pi*c_data['freq_phase']*(time-time[0])-c_data['phase'][0], color='purple', label=f'C phase change')
+    plt.plot(time, b_data['phase']-2*np.pi*b_data['freq_phase']*(time-time[0])-b_data['phase'][0], color='orange', label=f'B phase change')
     plt.xlabel('Time (s)')
     plt.ylabel('Frequency (Hz)')
     plt.legend()
@@ -112,16 +314,6 @@ def plot_analysis(time, c_data, b_data, filename, title_prefix="", middle_col=No
         plt.title(f'{title_prefix}\n{filename}')
         plt.show()
 
-def analyze_and_plot_segment(segment_img, time, filename, title_prefix, show_plots=True):
-    middle_col = segment_img.shape[1] // 2
-    left_avg = np.mean(segment_img[:, :middle_col], axis=1)
-    right_avg = np.mean(segment_img[:, middle_col:], axis=1)
-    c_data = process_signal(left_avg)
-    b_data = process_signal(right_avg)
-    if show_plots:
-        plot_analysis(time, c_data, b_data, filename, title_prefix, middle_col, segment_img)
-
-#Movmement detection code provided by Maximilian Kotz
 def detect_movement_start(kymo: np.ndarray,
                           window_size: int = 5,
                           threshold_factor: float = TF,
@@ -146,7 +338,7 @@ def detect_movement_start(kymo: np.ndarray,
         activity = np.median(std_per_space, axis=1)
     else:
         raise ValueError("spatial_agg must be ‘mean’ or ‘median’")
-    
+
     baseline = np.median(activity)
     baseline_std = np.std(activity)
     # 5) Find first window where activity spikes above threshold
@@ -197,9 +389,9 @@ def choose_split_col(img, split):
     return max(1, min(col, n_cols - 1))
 
 def analyze_before_after_beam_oscillation(
-    img, 
-    time, 
-    filename, 
+    img,
+    time,
+    filename,
     show_plots=True,
     use_movement_detector=True,
     std_window_size=5,
@@ -207,16 +399,16 @@ def analyze_before_after_beam_oscillation(
     split=0.5  # Default split at middle column (0.5 means middle of the image width)
 ):
     middle_col = choose_split_col(img, split)
-    left_avg = np.mean(img[:, :middle_col], axis=1)
-    right_avg = np.mean(img[:, middle_col:], axis=1)
-    
+    left = img[:, :middle_col]
+    right= img[:, middle_col:]
+
     # Initialize split_index using detect_movement_start
     split_index = None
     if use_movement_detector:
         try:
             split_index = detect_movement_start(
-                img, 
-                window_size=std_window_size, 
+                img,
+                window_size=std_window_size,
                 threshold_factor=TF  # Adjust based on your noise level
             )
             print(f"{filename}: Movement detected at index {split_index} (time = {time[split_index]:.2f}s)")
@@ -227,13 +419,13 @@ def analyze_before_after_beam_oscillation(
     # Fallback to phase threshold if movement detection fails
     if split_index is None or split_index <= 0 or split_index >= len(time) - 1:
         print(f"{filename}: Falling back to phase threshold.")
-        full_b = process_signal(right_avg)
+        full_b = process_signal(right)
         cross_indices = np.where(full_b['phase'] > fallback_phase_threshold)[0]
         split_index = cross_indices[0] if len(cross_indices) > 0 else len(time) // 2  # Default midpoint
 
     # Ensure split_index is valid
     split_index = max(1, min(split_index, len(time) - 1))
-    
+
     # --- Plot activity trace from detect_movement_start for diagnostics ---
     if use_movement_detector and show_plots:
         plt.figure(figsize=(10, 4))
@@ -243,7 +435,7 @@ def analyze_before_after_beam_oscillation(
         baseline = np.median(activity)
         baseline_std = np.std(activity)
         thresh = baseline + TF * baseline_std  # Match threshold_factor=0.3
-        
+
         plt.plot(time[:len(activity)], activity, label='Activity (Mean STD)')
         plt.axhline(thresh, color='r', linestyle='--', label='Threshold')
         plt.axvline(time[split_index], color='k', linestyle=':', label='Detected Onset')
@@ -256,23 +448,14 @@ def analyze_before_after_beam_oscillation(
     # --- Split data and analyze ---
     before_time = time[:split_index]
     after_time = time[split_index:]
+
+    before_c = process_signal(left[:split_index,:])
+    before_b = process_signal(right[:split_index,:])
+
+    after_c = process_signal(left[split_index:,:])
+    after_b = process_signal(right[split_index:,:])
     
-    # Process signals only if segments are long enough
-    min_length = WINDOW_LENGTH * 2  # Ensure Savitzky-Golay can be applied
-    if len(before_time) >= min_length:
-        before_c = process_signal(left_avg[:split_index])
-        before_b = process_signal(right_avg[:split_index])
-    else:
-        print(f"{filename}: 'Before' segment too short for analysis.")
-        before_c, before_b = None, None
-    
-    if len(after_time) >= min_length:
-        after_c = process_signal(left_avg[split_index:])
-        after_b = process_signal(right_avg[split_index:])
-    else:
-        print(f"{filename}: 'After' segment too short for analysis.")
-        after_c, after_b = None, None
-    
+
     # --- Plot results ---
     if show_plots:
         if before_c and before_b:
@@ -286,31 +469,6 @@ def analyze_before_after_beam_oscillation(
                 after_time, after_c, after_b, filename,
                 title_prefix="After Beam Oscillations",
                 segment_img=img[split_index:]
-            )
-def analyze_kymographs(filepath_pattern, show_plots=True, increment=100):
-    filepaths = glob.glob(filepath_pattern)
-    if not filepaths:
-        print(f"No files found matching pattern: {filepath_pattern}")
-        return
-
-    for fpath in filepaths:
-        img = skio.imread(fpath, plugin="tifffile")
-        filename = Path(fpath).name
-        total_rows = img.shape[0]
-        num_segments = int(np.ceil(total_rows / increment))
-
-        # Segment-wise analysis
-        for segment in range(num_segments):
-            start_row = segment * increment
-            end_row = min((segment + 1) * increment, total_rows)
-            segment_img = img[start_row:end_row]
-            time = np.arange(start_row, end_row) * DT
-            analyze_and_plot_segment(
-                segment_img=segment_img,
-                time=time,
-                filename=filename,
-                title_prefix=f'Segment {segment+1} (Rows {start_row}-{end_row-1})',
-                show_plots=show_plots
             )
 
 def plot_full_kymograph_before_after(filepath_pattern, phase_threshold=PTh, show_plots=True):
@@ -329,25 +487,6 @@ def plot_full_kymograph_before_after(filepath_pattern, phase_threshold=PTh, show
             fallback_phase_threshold=phase_threshold,
             split=None
         )
-
-def plot_full_kymograph_analysis(filepath_pattern, show_plots=True):
-    filepaths = glob.glob(filepath_pattern)
-    for fpath in filepaths:
-        img = skio.imread(fpath, plugin="tifffile")
-        filename = Path(fpath).name
-        time = np.arange(img.shape[0]) * DT
-        analyze_and_plot_segment(img, time, filename, "Full Kymograph", show_plots=show_plots)
-
-
-#change location based on where your kymographs are stored and how they're named ( For ex:"C:/Users/ridhi/Downloads/*.tif")
-# Analyze each segment of each kymograph
-#analyze_kymographs("C:/Users/ridhi/Downloads/*.tif", increment=100)
-
-# Analyze the full kymograph
-#plot_full_kymograph_analysis("C:/Users/ridhi/Downloads/*.tif", show_plots=True)
-
-# Analyze full kymograph split into before/after beam oscillation
-
 
 if __name__ == "__main__":
     plot_full_kymograph_before_after("/home/max/Downloads/Kymographs/*.tif", show_plots=True)
